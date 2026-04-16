@@ -1,0 +1,46 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Terraform variable files with sensitive data
+# (keep terraform.tfvars in git if it has no secrets, but exclude any secrets files)
+*.auto.tfvars
+secrets.tfvars
+sensitive.tfvars
+
+# SSH Keys - NEVER commit private keys
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+
+# Packer
+packer_cache/
+*.box
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AWS credentials
+.aws/
+credentials
