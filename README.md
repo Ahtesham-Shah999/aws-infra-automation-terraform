@@ -14,12 +14,35 @@ A complete AWS infrastructure provisioned entirely via Terraform — no manual A
 ```
 .
 ├── environments/
-│   └── main/           # Root Terraform configuration
+│   ├── main/               # Root Terraform configuration (Tasks 1–5)
+│   │   ├── vpc.tf          # Task 1: VPC, subnets, IGW, NAT, route tables
+│   │   ├── security_groups.tf  # Task 2: ALB, web, and DB security groups
+│   │   ├── ec2.tf          # Task 2: Public web server + private DB server
+│   │   ├── key_pair.tf     # Task 2: SSH key pair (RSA-4096)
+│   │   ├── s3.tf           # Task 3: S3 bucket (versioning, encryption, block public)
+│   │   ├── iam.tf          # Task 3: IAM role + policy for EC2 → S3
+│   │   ├── dynamodb.tf     # Task 3: DynamoDB state-lock table
+│   │   ├── backend.tf      # Task 3: S3 remote backend configuration
+│   │   ├── launch_template.tf  # Task 4: Launch template with stress-ng
+│   │   ├── autoscaling.tf  # Task 4: ASG + scale-out/in policies
+│   │   ├── cloudwatch.tf   # Task 4: CPU high/low alarms
+│   │   ├── alb.tf          # Task 5: ALB, target group, listener, ASG attachment
+│   │   ├── providers.tf    # Provider + required_providers
+│   │   ├── variables.tf    # All input variable definitions
+│   │   ├── terraform.tfvars # Variable values (update my_ip!)
+│   │   └── outputs.tf      # All resource outputs
+│   └── modules-demo/       # Task 6: Demonstrates calling all reusable modules
+│       ├── main.tf         # Calls module.vpc, module.security, module.web, module.db
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── providers.tf
+│       └── terraform.tfvars
 ├── modules/
-│   ├── vpc/            # Reusable VPC module
-│   ├── compute/        # Reusable EC2 module
-│   └── security/       # Reusable Security Groups module
-└── packer/             # Packer template for custom AMI
+│   ├── vpc/                # Task 6: Reusable VPC module
+│   ├── compute/            # Task 6: Reusable EC2 compute module
+│   └── security/           # Task 6: Reusable Security Groups module
+└── packer/
+    └── build.pkr.hcl       # Task 6: Packer template for custom AMI
 ```
 
 ## Prerequisites
@@ -29,9 +52,11 @@ A complete AWS infrastructure provisioned entirely via Terraform — no manual A
 - AWS CLI configured with credentials (`aws configure`)
 - An AWS account with appropriate IAM permissions
 
-## Quick Start
+---
 
-### 1. Configure your variables
+## Task 1–5: Main Environment
+
+### 1. Configure variables
 
 ```bash
 cd environments/main
@@ -44,27 +69,72 @@ Edit `terraform.tfvars` and set:
 
 ### 2. Initialize and Apply (Two-Step for S3 Backend)
 
-**Step 1 — Create infrastructure (local state):**
+**Step 1 — Create infrastructure with local state:**
 ```bash
 terraform init
 terraform plan
 terraform apply
 ```
 
-**Step 2 — Migrate state to S3 (after bucket is created):**
+Note the `s3_bucket_name` value from the Terraform output.
 
-1. Note the `s3_bucket_name` from Terraform output
-2. Open `backend.tf`, uncomment the `terraform {}` block, and replace `REPLACE_WITH_OUTPUT_s3_bucket_name` with the actual bucket name
-3. Run:
+**Step 2 — Migrate state to S3:**
+
+Open `backend.tf`, replace the `bucket` value with the output from Step 1, then run:
 ```bash
 terraform init -migrate-state
 ```
+
+Confirm `yes` to migrate the local state file into S3. After migration:
+- The `.tfstate` file lives in the S3 bucket
+- All state operations are locked via DynamoDB
 
 ### 3. Destroy all resources
 
 ```bash
 terraform destroy
 ```
+
+---
+
+## Task 6: Modules Demo
+
+The `environments/modules-demo/` directory demonstrates how the three reusable
+modules (`modules/vpc`, `modules/security`, `modules/compute`) are called from
+a root `main.tf` using cross-module references.
+
+```bash
+cd environments/modules-demo
+
+# Update my_ip in terraform.tfvars first
+terraform init
+terraform plan
+terraform apply
+terraform destroy
+```
+
+Key cross-module references in `main.tf`:
+- `module.vpc.vpc_id` → passed to `module.security`
+- `module.vpc.public_subnet_ids[0]` → passed to `module.web`
+- `module.vpc.private_subnet_ids[0]` → passed to `module.db`
+- `module.security.web_sg_id` → passed to `module.web`
+- `module.security.db_sg_id` → passed to `module.db`
+
+---
+
+## Task 6: Packer Custom AMI
+
+```bash
+cd packer
+packer init build.pkr.hcl
+packer build build.pkr.hcl
+```
+
+The resulting AMI (with Nginx, curl, and stress-ng pre-installed) will appear
+under EC2 → AMIs in the AWS Console. Copy the AMI ID and set it as `ami_id`
+in your `terraform.tfvars`.
+
+---
 
 ## Git Workflow
 
@@ -76,5 +146,8 @@ terraform destroy
 ## Important Notes
 
 - **Never commit** `.pem` key files, `.terraform/` directories, or real credentials
-- The `terraform.tfvars` file contains non-sensitive defaults; update `my_ip` before applying
-- SSH into the private (DB) instance via the public (Web) instance as a bastion host
+- The `terraform.tfvars` files contain non-sensitive defaults; update `my_ip` before applying
+- SSH into the private (DB) instance via the public (Web) instance as a bastion host:
+  ```bash
+  ssh -i devops-a3-key.pem -J ubuntu@<web-public-ip> ubuntu@<db-private-ip>
+  ```

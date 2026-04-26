@@ -1,0 +1,102 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Assignment 4 – Task 7: Manual Rollback Pipeline
+// Flips the ALB listener back to the previous color, no parameters needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Library('devops-shared-lib') _
+
+pipeline {
+    agent { label 'linux-agent' }
+
+    environment {
+        AWS_REGION       = 'us-east-1'
+        MAIN_LISTENER_ARN = credentials('alb-main-listener-arn')
+        TG_BLUE_ARN      = credentials('alb-tg-blue-arn')
+        TG_GREEN_ARN     = credentials('alb-tg-green-arn')
+        DEPLOY_LOG_BUCKET = credentials('deploy-log-bucket-name')
+    }
+
+    stages {
+
+        stage('Determine Current Live Color') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-access-key']]) {
+                    script {
+                        env.CURRENT_TG = sh(
+                            script: """
+                                aws elbv2 describe-listeners \
+                                  --listener-arns "${MAIN_LISTENER_ARN}" \
+                                  --region "${AWS_REGION}" \
+                                  --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+                                  --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (env.CURRENT_TG == env.TG_BLUE_ARN) {
+                            env.ROLLBACK_TO_TG = env.TG_GREEN_ARN
+                            env.ROLLBACK_COLOR  = 'green'
+                            env.LIVE_COLOR      = 'blue'
+                        } else {
+                            env.ROLLBACK_TO_TG = env.TG_BLUE_ARN
+                            env.ROLLBACK_COLOR  = 'blue'
+                            env.LIVE_COLOR      = 'green'
+                        }
+
+                        echo "Current LIVE color: ${env.LIVE_COLOR}"
+                        echo "Rolling back to:    ${env.ROLLBACK_COLOR}"
+                    }
+                }
+            }
+        }
+
+        stage('Rollback: Flip ALB Listener') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-access-key']]) {
+                    sh """
+                        aws elbv2 modify-listener \
+                          --listener-arn "${MAIN_LISTENER_ARN}" \
+                          --region "${AWS_REGION}" \
+                          --default-actions "Type=forward,TargetGroupArn=${env.ROLLBACK_TO_TG}"
+
+                        echo "ALB listener switched to ${env.ROLLBACK_COLOR}"
+                    """
+                }
+            }
+        }
+
+        stage('Append Rollback to Deploy Log') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-access-key']]) {
+                    sh """
+                        TIMESTAMP=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                        LOG_ENTRY="{\\\"timestamp\\\":\\\"\${TIMESTAMP}\\\",\\\"sha\\\":\\\"rollback\\\",\\\"image\\\":\\\"N/A\\\",\\\"previous_color\\\":\\\"${env.LIVE_COLOR}\\\",\\\"new_color\\\":\\\"${env.ROLLBACK_COLOR}\\\",\\\"result\\\":\\\"rolled-back\\\"}"
+                        aws s3 cp "s3://${DEPLOY_LOG_BUCKET}/deploy-log.jsonl" /tmp/deploy-log.jsonl \
+                          --region "${AWS_REGION}" 2>/dev/null || touch /tmp/deploy-log.jsonl
+                        echo "\${LOG_ENTRY}" >> /tmp/deploy-log.jsonl
+                        aws s3 cp /tmp/deploy-log.jsonl "s3://${DEPLOY_LOG_BUCKET}/deploy-log.jsonl" \
+                          --region "${AWS_REGION}"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            notifySlack(
+                message: "⏪ ROLLBACK complete. Traffic is now on *${env.ROLLBACK_COLOR}*. Build <${env.BUILD_URL}|#${env.BUILD_NUMBER}>",
+                color  : 'warning'
+            )
+        }
+        failure {
+            notifySlack(
+                message: "🔴 ROLLBACK FAILED! Manual intervention required. Build <${env.BUILD_URL}|#${env.BUILD_NUMBER}>",
+                color  : 'danger'
+            )
+        }
+    }
+}

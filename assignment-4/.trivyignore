@@ -1,0 +1,10 @@
+# .trivyignore – CVEs we have reviewed and accepted with justification
+# Format: one CVE ID per line, comment lines start with #
+
+# CVE-2023-44487 (HTTP/2 Rapid Reset Attack)
+# Justification: Our ALB terminates HTTP/2 before it reaches this container.
+# This service only accepts internal traffic from the ALB target group.
+# Fix available in a newer alpine version but causes dependency conflicts.
+# Risk accepted by: Ahtesham Shah (22F-3627)
+# Review date: 2026-04-26
+CVE-2023-44487

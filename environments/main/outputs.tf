@@ -85,3 +85,14 @@ output "alb_arn" {
   description = "ARN of the Application Load Balancer"
   value       = aws_lb.web.arn
 }
+
+# ── Assignment 4 helpers ───────────────────────────────────────────────────────
+output "alb_sg_id" {
+  description = "ID of the ALB security group (used by A4 Blue-Green)"
+  value       = aws_security_group.alb.id
+}
+
+output "web_sg_id" {
+  description = "ID of the Web server security group (used by A4 Blue-Green)"
+  value       = aws_security_group.web.id
+}

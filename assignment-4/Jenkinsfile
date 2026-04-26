@@ -1,0 +1,203 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Assignment 4 – Task 2: Declarative Pipeline with Parallel Stages
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Library('devops-shared-lib') _
+
+pipeline {
+    agent { label 'linux-agent' }
+
+    environment {
+        SLACK_WEBHOOK = credentials('slack-webhook')
+        APP_DIR       = 'assignment-4/app'
+        IMAGE_NAME    = 'devops-a4-app'
+        AWS_REGION    = 'us-east-1'
+        ECR_REGISTRY  = credentials('ecr-registry-url')
+    }
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+
+        // ── Stage 1: Checkout ──────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHA = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.BRANCH_NAME_CLEAN = env.BRANCH_NAME.replaceAll('/', '-')
+                }
+                echo "Building commit ${env.GIT_SHA} on branch ${env.BRANCH_NAME}"
+            }
+        }
+
+        // ── Stage 2: Static Analysis (SonarQube) ──────────────────────────
+        stage('Static Analysis') {
+            steps {
+                dir(env.APP_DIR) {
+                    withSonarQubeEnv('sonarqube') {
+                        sh """
+                            npx sonar-scanner \
+                              -Dsonar.projectKey=devops-a4-app \
+                              -Dsonar.sources=src \
+                              -Dsonar.tests=tests \
+                              -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── Stage 3: Quality Gate ──────────────────────────────────────────
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ── Stage 4: Build ─────────────────────────────────────────────────
+        stage('Build') {
+            steps {
+                dir(env.APP_DIR) {
+                    sh 'npm ci'
+                }
+            }
+        }
+
+        // ── Stage 5: Test (parallel unit + integration) ────────────────────
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        dir(env.APP_DIR) {
+                            sh 'npm run test:unit -- --reporters=default --reporters=jest-junit 2>/dev/null || npm run test:unit'
+                        }
+                    }
+                    post {
+                        always {
+                            junit allowEmptyResults: true, testResults: "${env.APP_DIR}/junit.xml"
+                        }
+                    }
+                }
+                stage('Integration Tests') {
+                    steps {
+                        dir(env.APP_DIR) {
+                            sh 'npm run test:integration -- --reporters=default --reporters=jest-junit 2>/dev/null || npm run test:integration'
+                        }
+                    }
+                    post {
+                        always {
+                            junit allowEmptyResults: true, testResults: "${env.APP_DIR}/junit.xml"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Stage 6: Container Build ───────────────────────────────────────
+        stage('Container Build') {
+            steps {
+                dir(env.APP_DIR) {
+                    sh """
+                        docker build \
+                          -t ${IMAGE_NAME}:${env.GIT_SHA} \
+                          -t ${IMAGE_NAME}:${env.BRANCH_NAME_CLEAN} \
+                          .
+                    """
+                }
+            }
+        }
+
+        // ── Stage 7: Security Scan (Trivy) ────────────────────────────────
+        stage('Security Scan') {
+            steps {
+                sh """
+                    trivy image \
+                      --exit-code 1 \
+                      --severity HIGH,CRITICAL \
+                      --ignore-unfixed \
+                      --ignorefile assignment-4/.trivyignore \
+                      --format table \
+                      --output trivy-report.txt \
+                      ${IMAGE_NAME}:${env.GIT_SHA}
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── Stage 8: Push to ECR ──────────────────────────────────────────
+        stage('Push to ECR') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-access-key']]) {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                          docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                        docker tag ${IMAGE_NAME}:${env.GIT_SHA}          ${ECR_REGISTRY}/${IMAGE_NAME}:${env.GIT_SHA}
+                        docker tag ${IMAGE_NAME}:${env.BRANCH_NAME_CLEAN} ${ECR_REGISTRY}/${IMAGE_NAME}:${env.BRANCH_NAME_CLEAN}
+
+                        docker push ${ECR_REGISTRY}/${IMAGE_NAME}:${env.GIT_SHA}
+                        docker push ${ECR_REGISTRY}/${IMAGE_NAME}:${env.BRANCH_NAME_CLEAN}
+                    """
+                }
+            }
+        }
+
+        // ── Stage 9: Deploy (Blue-Green, main branch only) ────────────────
+        stage('Deploy-Production') {
+            when { branch 'main' }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-access-key']]) {
+                    sh """
+                        chmod +x assignment-4/pipelines/scripts/blue_green_deploy.sh
+                        assignment-4/pipelines/scripts/blue_green_deploy.sh \
+                          ${ECR_REGISTRY}/${IMAGE_NAME}:${env.GIT_SHA} \
+                          ${env.GIT_SHA} \
+                          ${env.BRANCH_NAME_CLEAN}
+                    """
+                }
+            }
+        }
+    }
+
+    // ── Post Section ──────────────────────────────────────────────────────────
+    post {
+        always {
+            dir(env.APP_DIR) {
+                archiveArtifacts artifacts: 'coverage/**', allowEmptyArchive: true
+            }
+        }
+        success {
+            notifySlack(
+                message: "✅ Build *${env.JOB_NAME} #${env.BUILD_NUMBER}* succeeded on branch `${env.BRANCH_NAME}`. <${env.BUILD_URL}|Open Build>",
+                color: 'good'
+            )
+        }
+        failure {
+            notifySlack(
+                message: "❌ Build *${env.JOB_NAME} #${env.BUILD_NUMBER}* FAILED on branch `${env.BRANCH_NAME}`. <${env.BUILD_URL}|View Logs>",
+                color: 'danger'
+            )
+        }
+    }
+}
