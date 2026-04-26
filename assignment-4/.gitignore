@@ -1,0 +1,27 @@
+# Logs
+*.log
+npm-debug.log*
+
+# Node modules
+node_modules/
+
+# Coverage
+coverage/
+
+# Terraform state and secrets
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+*.pem
+.env
+
+# Jenkins build artifacts
+trivy-report.txt
+tfsec-report.txt
+tfplan
+
+# OS
+.DS_Store
+Thumbs.db

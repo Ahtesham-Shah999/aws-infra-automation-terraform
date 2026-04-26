@@ -6,8 +6,8 @@
 resource "aws_autoscaling_group" "web" {
   name                = "${var.project_name}-asg"
   min_size            = 1
-  max_size            = 3
-  desired_capacity    = 1
+  max_size            = 5
+  desired_capacity    = 2
   vpc_zone_identifier = aws_subnet.public[*].id
 
   launch_template {

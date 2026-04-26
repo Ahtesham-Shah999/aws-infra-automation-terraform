@@ -1,0 +1,162 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Assignment 4 – Task 6: Terraform CI/CD Pipeline
+// Job name: infra-pipeline
+// Parameters:
+//   ACTION       = plan | apply | destroy
+//   AUTO_APPROVE = true | false (default false)
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Library('devops-shared-lib') _
+
+pipeline {
+    agent { label 'linux-agent' }
+
+    parameters {
+        choice(
+            name        : 'ACTION',
+            choices     : ['plan', 'apply', 'destroy'],
+            description : 'Terraform action to run'
+        )
+        booleanParam(
+            name        : 'AUTO_APPROVE',
+            defaultValue: false,
+            description : 'Skip the manual approval gate (dangerous for destroy!)'
+        )
+    }
+
+    environment {
+        TF_DIR        = 'environments/main'
+        TF_PLAN_FILE  = 'tfplan'
+        AWS_REGION    = 'us-east-1'
+    }
+
+    stages {
+
+        // ── Stage 1: Checkout ──────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        // ── Stage 2: Fmt & Validate ────────────────────────────────────────
+        stage('Fmt & Validate') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-access-key']]) {
+                    dir(env.TF_DIR) {
+                        sh 'terraform init -reconfigure -input=false'
+                        sh 'terraform fmt -check -recursive'
+                        sh 'terraform validate'
+                    }
+                }
+            }
+        }
+
+        // ── Stage 3: Security Scan (tfsec) ────────────────────────────────
+        stage('Security Scan') {
+            steps {
+                sh """
+                    docker run --rm \
+                      -v "\$(pwd)/${env.TF_DIR}:/src" \
+                      aquasec/tfsec:latest /src \
+                      --format lovely \
+                      --minimum-severity HIGH \
+                      --out /src/tfsec-report.txt || true
+
+                    cat ${env.TF_DIR}/tfsec-report.txt
+
+                    # Fail if any HIGH/CRITICAL findings exist
+                    if grep -qE '(HIGH|CRITICAL)' ${env.TF_DIR}/tfsec-report.txt; then
+                        echo "tfsec found HIGH or CRITICAL findings. Failing build."
+                        exit 1
+                    fi
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${env.TF_DIR}/tfsec-report.txt",
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── Stage 4: Plan ──────────────────────────────────────────────────
+        stage('Plan') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-access-key']]) {
+                    dir(env.TF_DIR) {
+                        script {
+                            if (params.ACTION == 'destroy') {
+                                sh "terraform plan -destroy -out=${env.TF_PLAN_FILE} -input=false"
+                            } else {
+                                sh "terraform plan -out=${env.TF_PLAN_FILE} -input=false"
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${env.TF_DIR}/${env.TF_PLAN_FILE}",
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── Stage 5: Manual Approval ───────────────────────────────────────
+        stage('Manual Approval') {
+            when {
+                allOf {
+                    anyOf {
+                        expression { params.ACTION == 'apply' }
+                        expression { params.ACTION == 'destroy' }
+                    }
+                    expression { !params.AUTO_APPROVE }
+                }
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input(
+                        message: "⚠️  You are about to run terraform ${params.ACTION}. Review the archived plan and confirm.",
+                        ok     : "Approve ${params.ACTION}"
+                    )
+                }
+            }
+        }
+
+        // ── Stage 6: Apply / Destroy ───────────────────────────────────────
+        stage('Apply / Destroy') {
+            when {
+                anyOf {
+                    expression { params.ACTION == 'apply' }
+                    expression { params.ACTION == 'destroy' }
+                }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-access-key']]) {
+                    dir(env.TF_DIR) {
+                        sh "terraform apply -input=false ${env.TF_PLAN_FILE}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            notifySlack(
+                message: "✅ infra-pipeline *${params.ACTION}* succeeded. Build <${env.BUILD_URL}|#${env.BUILD_NUMBER}>",
+                color  : 'good'
+            )
+        }
+        failure {
+            notifySlack(
+                message: "❌ infra-pipeline *${params.ACTION}* FAILED. Build <${env.BUILD_URL}|#${env.BUILD_NUMBER}>",
+                color  : 'danger'
+            )
+        }
+    }
+}
